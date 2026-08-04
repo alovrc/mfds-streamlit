@@ -7,6 +7,16 @@ from typing import Any
 
 from result_partition import ACTIVE_STATUSES, VIOLATION_LABELS
 
+HIDDEN_UNCERTAINTY_CODES = {"SEARCH_NO_OFFICIAL_EVIDENCE"}
+
+
+def _uncertainty_text(codes: list[str]) -> str:
+    return ", ".join(
+        str(code)
+        for code in codes
+        if str(code) not in HIDDEN_UNCERTAINTY_CODES
+    )
+
 
 def _text(value: Any, default: str = "-") -> str:
     if value in (None, "", [], {}):
@@ -176,11 +186,11 @@ def build_markdown_report(
             ],
         )
     )
-    active_high = [
+    supported_reviews = [
         review
         for product in output.get("product_results", [])
         for review in product.get("violation_reviews", [])
-        if review.get("status") == "HIGH"
+        if review.get("status") in {"HIGH", "REVIEW", "LOW"}
     ]
     unresolved = [
         review
@@ -189,18 +199,28 @@ def build_markdown_report(
         if review.get("status") == "INSUFFICIENT_EVIDENCE"
     ]
     if (
-        output.get("record_overall_status") == "INSUFFICIENT_EVIDENCE"
-        and active_high
-        and unresolved
+        output.get("record_overall_status") == "SUFFICIENT_EVIDENCE"
+        and supported_reviews
     ):
         lines.extend(
             [
                 "",
                 (
-                    "> 유효 최고위험 항목은 Rule 및 관련 근거가 확보되어 "
-                    "HIGH로 평가되었습니다. 전체 검토상태 "
-                    "`INSUFFICIENT_EVIDENCE`는 별도의 미해결 후보가 있음을 "
-                    "나타내며, HIGH 항목의 근거 부족을 의미하지 않습니다."
+                    "> 원문 문제표현과 Rule ID가 연결된 유효 위반 후보가 있어 전체 "
+                    "검토상태를 `SUFFICIENT_EVIDENCE`로 평가했습니다. "
+                    "공식근거 ID와 사례 ID는 보조 검색근거이며, 검색되지 "
+                    "않아도 Rule ID와 Rule 설명으로 판단근거를 제시합니다."
+                ),
+            ]
+        )
+    if unresolved:
+        lines.extend(
+            [
+                "",
+                (
+                    f"> 증거요건 미충족 후보 {len(unresolved)}개는 "
+                    "`INSUFFICIENT_EVIDENCE`로 유지되며 담당자 확인이 "
+                    "필요합니다."
                 ),
             ]
         )
@@ -319,7 +339,9 @@ def build_markdown_report(
                 route.get("stage2_route"),
                 route.get("store_alias"),
                 ", ".join(classified.get("evidence_ids", [])),
-                ", ".join(classified.get("uncertainty_codes", [])),
+                _uncertainty_text(
+                    classified.get("uncertainty_codes", [])
+                ),
             )
         )
     lines.extend(
@@ -405,7 +427,13 @@ def build_markdown_report(
                 f"- Rule ID: {_text(review.get('rule_ids'))}",
                 f"- 공식근거 ID: {_text(review.get('official_evidence_ids'))}",
                 f"- 사례 ID: {_text(review.get('case_ids'))}",
-                f"- 불확실성 코드: {_text(review.get('uncertainty_codes'))}",
+                "- 불확실성 코드: "
+                + (
+                    _uncertainty_text(
+                        review.get("uncertainty_codes", [])
+                    )
+                    or "-"
+                ),
                 "- 문제 표현:",
             ]
         )
@@ -425,12 +453,13 @@ def build_markdown_report(
             list(review.get("rule_ids", [])),
             citations,
         )
-        _append_evidence_details(
-            lines,
-            "공식 검색근거·인용문",
-            list(review.get("official_evidence_ids", [])),
-            citations,
-        )
+        if review.get("official_evidence_ids"):
+            _append_evidence_details(
+                lines,
+                "공식 검색근거·인용문",
+                list(review.get("official_evidence_ids", [])),
+                citations,
+            )
         _append_evidence_details(
             lines,
             "참고 사례",
@@ -514,7 +543,8 @@ def build_markdown_report(
     ]
     if uncertainty_codes:
         review_items.append(
-            "오류·불확실성 코드 확인: " + ", ".join(uncertainty_codes)
+            "오류·불확실성 코드 확인: "
+            + _uncertainty_text(uncertainty_codes)
         )
     lines.extend(f"- {item}" for item in review_items)
     lines.extend(

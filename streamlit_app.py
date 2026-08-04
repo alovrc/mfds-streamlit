@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+from PIL import Image, UnidentifiedImageError
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PACKAGE_ROOT))
@@ -17,9 +19,22 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 from scripts.run_pipeline import failure_record, run
 from auth import verify_password
 from markdown_report import build_markdown_report
+from ocr_pipeline import collect_and_ocr, merge_capture_text
 from result_partition import independent_review_output
+from web_capture import CaptureError
 
 STORE_ALIASES = ("FS01_PRODUCT_GATE", "FS11_FOOD_REVIEW", "FS21_HFF_REVIEW")
+HIDDEN_UNCERTAINTY_CODES = {"SEARCH_NO_OFFICIAL_EVIDENCE"}
+
+
+def display_uncertainty_codes(codes: list[str]) -> str:
+    """Return user-facing labels while preserving raw codes in JSON outputs."""
+
+    return ", ".join(
+        str(code)
+        for code in codes
+        if str(code) not in HIDDEN_UNCERTAINTY_CODES
+    )
 
 
 def configure_from_secrets() -> None:
@@ -135,7 +150,9 @@ def review_rows(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
                     "상태": product["product_overall_status"],
                     "위험도": product["product_overall_risk_score"],
                     "담당자 검토": product["requires_human_review"],
-                    "불확실성 코드": ", ".join(product["uncertainty_codes"]),
+                    "불확실성 코드": display_uncertainty_codes(
+                        product["uncertainty_codes"]
+                    ),
                 }
             )
     return sorted(
@@ -187,21 +204,172 @@ def run_provider(provider: str, source: dict[str, Any]) -> None:
             st.success(f"{provider} 실행과 계약 검증이 완료됐습니다.")
 
 
+def _reset_ocr_capture() -> None:
+    st.session_state.pop("ocr_capture", None)
+    for key in list(st.session_state):
+        if key.startswith(("ocr_reviewed_", "ocr_included_")):
+            st.session_state.pop(key, None)
+
+
+def _is_renderable_image(image_bytes: bytes | None) -> bool:
+    """Return whether Streamlit/Pillow can safely render downloaded bytes."""
+
+    if not image_bytes:
+        return False
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.verify()
+    except (UnidentifiedImageError, OSError, ValueError):
+        return False
+    return True
+
+
+def _render_ocr_capture_editor(capture: dict[str, Any]) -> None:
+    """Show OCR source text without exposing engine confidence scores."""
+
+    st.markdown("### URL 수집·OCR 시험 결과")
+    first, second, third, fourth = st.columns(4)
+    first.metric("본문 글자 수", len(capture["body_text"]))
+    second.metric("발견 이미지", capture["image_discovered_count"])
+    third.metric("OCR 대상", capture["image_selected_count"])
+    fourth.metric("중복 제외", capture["duplicate_image_count"])
+    st.caption(f"최종 도착 URL: {capture['final_url']}")
+    if capture["image_limit_reached"]:
+        st.warning("이미지가 많아 앞의 20개 이미지만 OCR 대상으로 사용했습니다.")
+
+    status_counts = capture["ocr_status_counts"]
+    st.caption(
+        " · ".join(
+            [
+                f"성공 {status_counts.get('SUCCESS', 0)}",
+                f"부분성공 {status_counts.get('PARTIAL_SUCCESS', 0)}",
+                f"문자없음 {status_counts.get('NO_TEXT_DETECTED', 0)}",
+                f"실패 {status_counts.get('FAILED', 0)}",
+                f"다운로드실패 {status_counts.get('IMAGE_FETCH_FAILED', 0)}",
+            ]
+        )
+    )
+
+    for record in capture["ocr_records"]:
+        label = f"{record['source_id']} · {record['ocr_status']}"
+        with st.expander(label, expanded=False):
+            image_bytes = record.get("_image_bytes")
+            if _is_renderable_image(image_bytes):
+                st.image(image_bytes, caption=record["image_url"], width=480)
+            else:
+                st.caption(record["image_url"])
+            if record["error_code"]:
+                st.warning(f"처리 오류: {record['error_code']}")
+
+            reviewed_key = f"ocr_reviewed_{record['source_id']}"
+            included_key = f"ocr_included_{record['source_id']}"
+            st.session_state.setdefault(
+                reviewed_key,
+                record.get("reviewed_text") or record.get("ocr_text") or "",
+            )
+            st.session_state.setdefault(
+                included_key,
+                bool(record.get("included_in_analysis")),
+            )
+            reviewed = st.text_area(
+                "OCR 문구 검토",
+                key=reviewed_key,
+                height=120,
+                help=(
+                    "수정해도 엔진 OCR 원문은 보존되고, 수정본은 "
+                    "reviewed_text로 별도 관리됩니다."
+                ),
+            ).strip()
+            record["reviewed_text"] = (
+                reviewed if reviewed != (record.get("ocr_text") or "").strip() else None
+            )
+            record["included_in_analysis"] = st.checkbox(
+                "OpenAI 분석에 포함",
+                key=included_key,
+                disabled=not bool(reviewed),
+            )
+
+    if st.button(
+        "본문＋검토된 OCR 문구 다시 병합",
+        use_container_width=True,
+        key="apply_ocr_merge",
+    ):
+        capture["merged_text"] = merge_capture_text(
+            capture["title"],
+            capture["body_text"],
+            capture["ocr_records"],
+        )
+        st.session_state.input_body_text = capture["merged_text"]
+        st.success("현재 OCR 검토 내용을 게시물 본문 입력란에 반영했습니다.")
+
+
 def render_input() -> dict[str, Any]:
     st.subheader("광고 입력")
-    record_id = st.text_input("레코드 ID", value="MFDS-REVIEW-001")
-    title = st.text_input("게시물 제목")
+    st.info(
+        "OCR 시험 기능입니다. Tesseract가 Streamlit 서버에서 직접 실행됩니다."
+    )
+    record_id = st.text_input(
+        "레코드 ID",
+        value="MFDS-REVIEW-001",
+        key="input_record_id",
+    )
+    source_url = st.text_input(
+        "원문 URL",
+        key="input_source_url",
+        help="공개 http·https URL만 수집하며 내부·사설 IP 접근은 차단합니다.",
+    )
+    capture_col, clear_capture_col = st.columns(2)
+    if capture_col.button(
+        "URL 수집·한글 OCR 실행",
+        type="secondary",
+        use_container_width=True,
+    ):
+        _reset_ocr_capture()
+        with st.spinner("본문과 이미지를 수집하고 Tesseract OCR을 실행합니다."):
+            try:
+                capture = collect_and_ocr(source_url)
+            except CaptureError as error:
+                st.error(f"URL 수집 실패: {error.code} · {error}")
+            except Exception as error:
+                st.error(f"OCR 실행 실패: {type(error).__name__}")
+            else:
+                st.session_state.ocr_capture = capture
+                if capture["title"]:
+                    st.session_state.input_title = capture["title"]
+                st.session_state.input_body_text = capture["merged_text"]
+                if "blog.naver.com" in capture["final_url"]:
+                    st.session_state.input_platform = "네이버 블로그"
+                st.success("URL 수집과 OCR이 완료됐습니다.")
+    if clear_capture_col.button(
+        "OCR 수집결과 초기화",
+        use_container_width=True,
+    ):
+        _reset_ocr_capture()
+        st.session_state.input_body_text = ""
+
+    capture = st.session_state.get("ocr_capture")
+    if capture:
+        _render_ocr_capture_editor(capture)
+
+    title = st.text_input("게시물 제목", key="input_title")
     product_name = st.text_input(
         "제품명 (선택)",
+        key="input_product_name",
         help=(
             "입력하면 공개 승인 건강기능식품 제품 마스터에서 "
             "정규화 품목명 정확조회를 수행합니다."
         ),
     )
-    body_text = st.text_area("게시물 본문", height=240)
-    left, right = st.columns(2)
-    platform = left.text_input("플랫폼", placeholder="예: 네이버 블로그")
-    source_url = right.text_input("원문 URL")
+    body_text = st.text_area(
+        "게시물 본문＋OCR 병합문",
+        height=320,
+        key="input_body_text",
+    )
+    platform = st.text_input(
+        "플랫폼",
+        placeholder="예: 네이버 블로그",
+        key="input_platform",
+    )
     return {
         "record_id": record_id.strip(),
         "title": title.strip(),
@@ -220,7 +388,13 @@ def render_evidence_group(
 
     st.markdown(f"**{label}**")
     if not evidence:
-        st.caption("연결된 근거가 없습니다.")
+        if "공식" in label:
+            st.caption(
+                "공식근거 ID는 검색되지 않았습니다. 이 후보의 적용 근거는 "
+                "위의 로컬 Rule ID와 Rule 설명으로 제시합니다."
+            )
+        else:
+            st.caption("연결된 근거가 없습니다.")
         return
     for item in evidence:
         record_id = item.get("record_id") or "-"
@@ -246,6 +420,7 @@ def render_independent_report(report: dict[str, Any]) -> None:
 
     st.subheader("광고 원문 독립검토 결과")
     findings = report["independent_findings"]
+    unresolved_findings = report.get("unresolved_findings", [])
     if not findings:
         st.info("현재 광고 원문에서 탐지된 위반 가능 항목이 없습니다.")
     else:
@@ -259,7 +434,10 @@ def render_independent_report(report: dict[str, Any]) -> None:
                 "위험도": item["risk_score"],
                 "Rule ID 수": len(item["rule_ids"]),
                 "공식근거 ID 수": len(item["official_evidence_ids"]),
-                "불확실성": ", ".join(item["uncertainty_codes"]) or "-",
+                "불확실성": display_uncertainty_codes(
+                    item["uncertainty_codes"]
+                )
+                or "-",
             }
             for item in findings
         ]
@@ -289,10 +467,11 @@ def render_independent_report(report: dict[str, Any]) -> None:
                     "적용 Rule(로컬 결정론적 연결)",
                     evidence["rules"],
                 )
-                render_evidence_group(
-                    "공식 검색근거·인용문",
-                    evidence["official_evidence"],
-                )
+                if evidence["official_evidence"]:
+                    render_evidence_group(
+                        "공식 검색근거·인용문",
+                        evidence["official_evidence"],
+                    )
                 render_evidence_group("참고 사례", evidence["cases"])
 
                 st.markdown("**판단 사유**")
@@ -304,8 +483,39 @@ def render_independent_report(report: dict[str, Any]) -> None:
                 if item["uncertainty_codes"]:
                     st.warning(
                         "확인 필요: "
-                        + ", ".join(item["uncertainty_codes"])
+                        + display_uncertainty_codes(
+                            item["uncertainty_codes"]
+                        )
                     )
+    if unresolved_findings:
+        with st.expander(
+            f"증거요건 미충족 후보 {len(unresolved_findings)}개",
+            expanded=False,
+        ):
+            st.caption(
+                "아래 후보는 점수별 필수 증거요건을 충족하지 못해 "
+                "위험도·대표유형 집계에서 제외됐습니다."
+            )
+            st.dataframe(
+                [
+                    {
+                        "제품명": item["product_name"] or "-",
+                        "위반 후보": item["violation_label"],
+                        "상태": item["status"],
+                        "Rule ID 수": len(item["rule_ids"]),
+                        "공식근거 ID 수": len(
+                            item["official_evidence_ids"]
+                        ),
+                        "확인 필요": display_uncertainty_codes(
+                            item["uncertainty_codes"]
+                        )
+                        or "-",
+                    }
+                    for item in unresolved_findings
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
     st.caption(report["independent_findings_scope"])
 
 
@@ -335,11 +545,11 @@ def render_results() -> None:
             third.metric(
                 "담당자 검토", "필요" if output["requires_human_review"] else "불필요"
             )
-            active_high = [
+            supported_reviews = [
                 review
                 for product in output.get("product_results", [])
                 for review in product.get("violation_reviews", [])
-                if review.get("status") == "HIGH"
+                if review.get("status") in {"HIGH", "REVIEW", "LOW"}
             ]
             unresolved = [
                 review
@@ -349,15 +559,14 @@ def render_results() -> None:
             ]
             if (
                 output.get("record_overall_status")
-                == "INSUFFICIENT_EVIDENCE"
-                and active_high
-                and unresolved
+                == "SUFFICIENT_EVIDENCE"
+                and supported_reviews
             ):
                 st.info(
-                    "유효 최고위험 항목은 근거가 확보되어 HIGH로 평가됐습니다. "
-                    "전체 검토상태 INSUFFICIENT_EVIDENCE는 별도의 미해결 "
-                    "후보가 있음을 뜻하며, HIGH 항목의 근거 부족을 의미하지 "
-                    "않습니다."
+                    "원문 문제표현과 Rule ID가 연결된 유효 위반 후보가 있어 전체 "
+                    "검토상태를 SUFFICIENT_EVIDENCE로 평가했습니다. "
+                    "공식근거 ID와 사례 ID는 보조 검색근거이며, 검색되지 "
+                    "않아도 Rule ID와 Rule 설명으로 판단근거를 제시합니다."
                 )
             deterministic = output.get("deterministic_aggregation", {})
             if deterministic:
@@ -471,13 +680,14 @@ def render_results() -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="MFDS 2단계 File Search 검토",
+        page_title="MFDS 2단계 File Search OCR 시험",
         page_icon="🔎",
         layout="wide",
     )
     require_password()
     configure_from_secrets()
-    st.title("MFDS 2단계 Cloud File Search 검토")
+    openai_configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    st.title("MFDS 2단계 Cloud File Search OCR 시험")
     st.caption(
         "1단계 제품·경로 판정 → 제품별 2단계 검색 → 담당자 확인"
     )
@@ -485,7 +695,10 @@ def main() -> None:
         "법적 최종 판단 도구가 아닙니다. 원문·검색 근거·사실성을 담당자가 확인해야 합니다."
     )
     st.sidebar.subheader("운영 상태")
-    st.sidebar.success("OpenAI File Search 활성")
+    if openai_configured:
+        st.sidebar.success("OpenAI File Search 활성")
+    else:
+        st.sidebar.warning("OpenAI File Search 미설정")
     st.sidebar.info("Gemini 일시 중단")
     if st.sidebar.button("로그아웃", use_container_width=True):
         st.session_state.authenticated = False
@@ -502,7 +715,13 @@ def main() -> None:
     offline_col, openai_col, gemini_col, clear_col = st.columns(4)
     if offline_col.button("오프라인 계약 실행", use_container_width=True):
         run_provider("offline", source)
-    if openai_col.button("OpenAI 실행", type="primary", use_container_width=True):
+    if openai_col.button(
+        "OpenAI 실행",
+        type="primary",
+        disabled=not openai_configured,
+        help=None if openai_configured else "올바른 OpenAI 프로젝트 키를 Secrets에 설정해야 합니다.",
+        use_container_width=True,
+    ):
         run_provider("openai", source)
     gemini_col.button(
         "Gemini 중단됨",

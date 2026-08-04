@@ -3,6 +3,7 @@ from __future__ import annotations
 from risk_aggregation import (
     apply_deterministic_review_scores,
     build_deterministic_aggregation,
+    derive_record_evidence_status,
     load_risk_rules,
 )
 
@@ -179,6 +180,70 @@ def test_missing_rule_is_unresolved_and_not_scored() -> None:
     assert "SEARCH_NO_RULE" in finding["uncertainty_codes"]
     assert "SEARCH_NO_RULE" in output["uncertainty_codes"]
     assert output["requires_human_review"] is True
+
+
+def test_review_score_without_official_evidence_stays_active() -> None:
+    output = {
+        "problem_expressions": [expression("E1")],
+        "violation_reviews": [
+            review(
+                "CONSUMER_DECEPTION",
+                ["E1"],
+                score=7,
+                official=False,
+            )
+        ],
+        "uncertainty_codes": [],
+        "requires_human_review": False,
+    }
+
+    apply_deterministic_review_scores(output)
+
+    finding = output["violation_reviews"][0]
+    assert finding["risk_score"] == 7
+    assert finding["status"] == "REVIEW"
+    assert "SEARCH_NO_OFFICIAL_EVIDENCE" in finding["uncertainty_codes"]
+    assert output["requires_human_review"] is True
+
+
+def test_supported_candidate_makes_record_evidence_sufficient() -> None:
+    supported = review(
+        "CONSUMER_DECEPTION",
+        ["E1"],
+        score=7,
+        official=False,
+    )
+    unresolved = review(
+        "FALSE_EXAGGERATED",
+        ["E2"],
+        score=8,
+        official=False,
+    )
+    unresolved["status"] = "INSUFFICIENT_EVIDENCE"
+    unresolved["risk_score"] = 0
+
+    status = derive_record_evidence_status(
+        [{"violation_reviews": [supported, unresolved]}]
+    )
+
+    assert status == "SUFFICIENT_EVIDENCE"
+
+
+def test_only_unresolved_candidates_are_insufficient() -> None:
+    unresolved = review(
+        "CONSUMER_DECEPTION",
+        ["E1"],
+        score=7,
+        official=False,
+    )
+    unresolved["status"] = "INSUFFICIENT_EVIDENCE"
+    unresolved["risk_score"] = 0
+
+    status = derive_record_evidence_status(
+        [{"violation_reviews": [unresolved]}]
+    )
+
+    assert status == "INSUFFICIENT_EVIDENCE"
 
 
 def test_item_one_wins_exact_item_one_item_two_penalty_tie() -> None:
